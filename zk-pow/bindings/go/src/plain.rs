@@ -105,6 +105,7 @@ pub unsafe extern "C" fn verify_plain_proof_ffi(
     block_header: *const IncompleteBlockHeader,
     pp_bytes: *const u8,
     pp_len: usize,
+    nbits_override: u32,
     error_msg_out: *mut c_char,
 ) -> i32 {
     if block_header.is_null() || pp_bytes.is_null() || pp_len == 0 {
@@ -119,7 +120,11 @@ pub unsafe extern "C" fn verify_plain_proof_ffi(
             Ok(p) => p,
             Err(e) => return (1, format!("deserialize: {e}")),
         };
-        match verify::verify_plain_proof(&header, &pp) {
+        // The commitment (Hash A) is derived from block_header incl. its nbits, so the header must
+        // keep the nbits the miner mined; the difficulty is instead checked against nbits_override
+        // (the pool share target). 0 means "use the header's nbits" (block check).
+        let nover = if nbits_override == 0 { None } else { Some(nbits_override) };
+        match verify::verify_plain_proof(&header, &pp, nover) {
             Ok(()) => (0, "accepted".to_string()),
             Err(e) => (1, format!("rejected: {e}")),
         }
