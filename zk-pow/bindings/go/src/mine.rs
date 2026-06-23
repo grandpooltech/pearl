@@ -1,14 +1,13 @@
 //! Mining FFI - performs mining and returns a ZK proof directly.
 
 use std::os::raw::c_char;
-use std::slice;
 
-use zk_pow::api::proof::{IncompleteBlockHeader, MiningConfiguration, PublicProofParams};
+use zk_pow::api::proof::{IncompleteBlockHeader, MiningConfiguration};
 use zk_pow::api::prove;
 use zk_pow::ffi::mine::{mine as ffi_mine, mine_moe as ffi_mine_moe};
 use zk_pow::ffi::plain_proof::PlainProof;
 
-use crate::common::{acquire_cache, catch_panic, set_error_msg, CZKProof, MAX_ZK_PROOF_SIZE};
+use crate::common::{catch_panic, copy_prove_result, set_error_msg, zk_prove, CZKProof};
 
 // ============================================================================
 // Public FFI
@@ -122,17 +121,9 @@ unsafe fn mine_inner(
         None => return 2,
     };
 
-    let pd_len = result.public_data.len();
-    if !PublicProofParams::is_valid_wire_size(pd_len) {
-        set_error_msg(error_msg_out, &format!("public_data length {} is out of valid range", pd_len));
+    if !copy_prove_result(error_msg_out, out, &result) {
         return 2;
     }
-    out.public_data_len = pd_len;
-    out.public_data[..pd_len].copy_from_slice(&result.public_data);
-
-    let buffer = slice::from_raw_parts_mut(out.proof_blob, MAX_ZK_PROOF_SIZE);
-    buffer[..result.proof_data.len()].copy_from_slice(&result.proof_data);
-    out.proof_blob_len = result.proof_data.len();
 
     set_error_msg(error_msg_out, "Mining and proof generation successful");
     0
@@ -157,16 +148,5 @@ unsafe fn mine_and_prove(
         }
     };
 
-    let mut cache = acquire_cache();
-    match catch_panic(|| prove::zk_prove_plain_proof(header, &proof, &mut cache, false)) {
-        Ok(Ok(r)) => Some(r),
-        Ok(Err(e)) => {
-            set_error_msg(error_msg_out, &format!("Prove failed: {}", e));
-            None
-        }
-        Err(panic_msg) => {
-            set_error_msg(error_msg_out, &format!("Prove panic: {}", panic_msg));
-            None
-        }
-    }
+    zk_prove(error_msg_out, header, &proof)
 }

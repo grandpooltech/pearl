@@ -7,10 +7,10 @@ use std::os::raw::c_char;
 use std::slice;
 
 use zk_pow::api::proof::IncompleteBlockHeader;
-use zk_pow::api::{prove, verify};
+use zk_pow::api::verify;
 use zk_pow::ffi::plain_proof::PlainProof;
 
-use crate::common::{acquire_cache, catch_panic, set_error_msg, CZKProof, MAX_ZK_PROOF_SIZE};
+use crate::common::{catch_panic, copy_prove_result, set_error_msg, zk_prove, CZKProof};
 
 /// Verify a bincode-serialized PlainProof against the block header. The jackpot difficulty is
 /// checked against `nbits_override` (the pool share target; 0 = use the header's own nbits, i.e. a
@@ -27,7 +27,7 @@ pub unsafe extern "C" fn verify_plain_proof_ffi(
 ) -> i32 {
     if block_header.is_null() || pp_bytes.is_null() || pp_len == 0 {
         set_error_msg(error_msg_out, "Null/empty input");
-        return 1;
+        return 2; // bad input (consistent with verify.rs and the docstring)
     }
     let header = *block_header;
     let bytes = slice::from_raw_parts(pp_bytes, pp_len);
@@ -81,44 +81,131 @@ pub unsafe extern "C" fn prove_plain_proof_ffi(
         return 2;
     }
 
-    let pp: PlainProof = match PlainProof::deserialize_compat(bytes) {
-        Ok(p) => p,
-        Err(e) => {
+    // Deserialize inside catch_panic so malformed input can't unwind across the FFI boundary (UB).
+    let pp = match catch_panic(|| PlainProof::deserialize_compat(bytes)) {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => {
             set_error_msg(error_msg_out, &format!("deserialize: {e}"));
             return 2;
         }
-    };
-
-    let mut cache = acquire_cache();
-    let result = match catch_panic(|| prove::zk_prove_plain_proof(header, &pp, &mut cache, false)) {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
-            set_error_msg(error_msg_out, &format!("prove: {e}"));
-            return 2;
-        }
         Err(panic_msg) => {
-            set_error_msg(error_msg_out, &format!("prove panic: {panic_msg}"));
+            set_error_msg(error_msg_out, &format!("deserialize panic: {panic_msg}"));
             return 2;
         }
     };
 
-    if result.proof_data.len() > MAX_ZK_PROOF_SIZE {
-        set_error_msg(error_msg_out, "proof exceeds MAX_ZK_PROOF_SIZE");
+    let result = match zk_prove(error_msg_out, header, &pp) {
+        Some(r) => r,
+        None => return 2,
+    };
+    if !copy_prove_result(error_msg_out, out, &result) {
         return 2;
     }
-    // Variable-length public data (V2/MoE): record the used length and copy that many bytes.
-    let pd = &result.public_data;
-    if pd.len() > out.public_data.len() {
-        set_error_msg(error_msg_out, "public_data exceeds buffer");
-        return 2;
-    }
-    out.public_data_len = pd.len();
-    out.public_data[..pd.len()].copy_from_slice(pd);
-
-    let buffer = slice::from_raw_parts_mut(out.proof_blob, MAX_ZK_PROOF_SIZE);
-    buffer[..result.proof_data.len()].copy_from_slice(&result.proof_data);
-    out.proof_blob_len = result.proof_data.len();
 
     set_error_msg(error_msg_out, "proof generation successful");
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::ffi::CStr;
+
+    use bincode::Options;
+    use rand_chacha::rand_core::SeedableRng;
+    use zk_pow::api::proof::{MMAType, MiningConfiguration, MoEConfig, PeriodicPattern};
+    use zk_pow::ffi::mine::try_mine_one_moe;
+
+    use crate::common::{ERROR_MSG_MAX_SIZE, MAX_ZK_PROOF_SIZE, PUBLICDATA_MAX_SIZE};
+    use crate::verify::verify_zk_proof_v2;
+
+    /// CI-fast MoE parameters with permissive difficulty, mirroring zk-pow's moe_test baseline.
+    fn test_params() -> (IncompleteBlockHeader, MiningConfiguration, usize, usize, usize) {
+        let k = 1024usize;
+        let header = IncompleteBlockHeader {
+            version: 0,
+            prev_block: [0; 32],
+            merkle_root: *b"0123456789abcdef0123456789abcdef",
+            timestamp: 0x66666666,
+            nbits: 0x207FFFFF,
+        };
+        let config = MiningConfiguration {
+            common_dim: k as u32,
+            rank: 32,
+            mma_type: MMAType::Int7xInt7ToInt32,
+            rows_pattern: PeriodicPattern::from_list(&[0, 8, 64, 72]).unwrap(),
+            cols_pattern: PeriodicPattern::from_list(&[0, 1, 8, 9, 32, 33, 40, 41]).unwrap(),
+            moe: Some(MoEConfig { e: 4, top_k: 1 }),
+        };
+        (header, config, 1024, 128, k)
+    }
+
+    /// Mine one PlainProof and serialize it the way a miner submits it (the inverse of
+    /// `PlainProof::deserialize_compat`).
+    fn mine_plain_proof_bytes() -> (IncompleteBlockHeader, Vec<u8>) {
+        let (header, config, m, n, k) = test_params();
+        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(0xC0FFEE);
+        let pp = loop {
+            if let Some(pp) = try_mine_one_moe(&mut rng, m, n, k, header, config, None, false).unwrap() {
+                break pp;
+            }
+        };
+        let bytes = bincode::options().with_fixint_encoding().serialize(&pp).unwrap();
+        (header, bytes)
+    }
+
+    fn err_str(buf: &[c_char]) -> String {
+        unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned()
+    }
+
+    fn new_czkproof(blob: &mut [u8]) -> CZKProof {
+        CZKProof {
+            public_data_len: 0,
+            public_data: [0u8; PUBLICDATA_MAX_SIZE],
+            proof_blob_len: 0,
+            proof_blob: blob.as_mut_ptr(),
+        }
+    }
+
+    /// End-to-end FFI flow: miner -> plain_proof -> verify_plain_proof_ffi -> prove_plain_proof_ffi
+    /// -> verify_zk_proof_v2. Guards the whole Go-facing boundary against regressions.
+    #[test]
+    fn plain_proof_ffi_flow() {
+        let (header, pp_bytes) = mine_plain_proof_bytes();
+        let mut err = [0 as c_char; ERROR_MSG_MAX_SIZE];
+
+        // 1. cheap blake3 share verify
+        let code =
+            unsafe { verify_plain_proof_ffi(&header, pp_bytes.as_ptr(), pp_bytes.len(), 0, err.as_mut_ptr()) };
+        assert_eq!(code, 0, "verify_plain_proof_ffi rejected a valid proof: {}", err_str(&err));
+
+        // 2. plonky2 prove into a caller-allocated CZKProof
+        let mut blob = vec![0u8; MAX_ZK_PROOF_SIZE];
+        let mut zk = new_czkproof(&mut blob);
+        let code =
+            unsafe { prove_plain_proof_ffi(&header, pp_bytes.as_ptr(), pp_bytes.len(), &mut zk, err.as_mut_ptr()) };
+        assert_eq!(code, 0, "prove_plain_proof_ffi failed: {}", err_str(&err));
+        assert!(zk.proof_blob_len > 0, "empty proof blob");
+        assert!(zk.public_data_len >= 24, "V2 public_data too short: {}", zk.public_data_len);
+
+        // 3. verify the produced V2 certificate
+        let code = unsafe { verify_zk_proof_v2(&header, &zk, err.as_mut_ptr()) };
+        assert_eq!(code, 0, "verify_zk_proof_v2 rejected the produced cert: {}", err_str(&err));
+    }
+
+    /// Regression for the panic-guard: malformed input must not unwind across the FFI boundary
+    /// (deserialization runs inside catch_panic) — it returns the bad-input code 2.
+    #[test]
+    fn prove_plain_proof_ffi_rejects_malformed_without_panic() {
+        let header = test_params().0;
+        let garbage = [0xFFu8; 64];
+        let mut blob = vec![0u8; MAX_ZK_PROOF_SIZE];
+        let mut zk = new_czkproof(&mut blob);
+        let mut err = [0 as c_char; ERROR_MSG_MAX_SIZE];
+
+        let code =
+            unsafe { prove_plain_proof_ffi(&header, garbage.as_ptr(), garbage.len(), &mut zk, err.as_mut_ptr()) };
+        assert_eq!(code, 2, "expected bad-input code 2, got {}: {}", code, err_str(&err));
+    }
 }
