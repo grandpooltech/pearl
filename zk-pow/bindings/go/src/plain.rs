@@ -1,6 +1,7 @@
 //! PlainProof FFI for the mining pool. Two entry points the pool links:
 //!   - `verify_plain_proof_ffi` — cheap blake3 share validation (no plonky2).
 //!   - `prove_plain_proof_ffi`  — plonky2 ZK certificate for block submission.
+//!
 //! Public data is variable-length (V2/MoE): `CZKProof.public_data_len` holds the used size.
 
 use std::os::raw::c_char;
