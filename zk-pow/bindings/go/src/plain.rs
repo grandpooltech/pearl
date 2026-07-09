@@ -17,6 +17,11 @@ use crate::common::{catch_panic, copy_prove_result, set_error_msg, zk_prove, CZK
 /// full-block check). The header's nbits is NOT modified — the proof commitment is derived from the
 /// header including its nbits, so it must stay what the miner mined. blake3-only (no plonky2).
 /// Returns 0 = accepted, 1 = rejected, 2 = bad input / panic; the reason is written to `error_msg_out`.
+///
+/// # Warning
+/// This function does not bound `pp_len`. `PlainProof::deserialize_compat` has no internal byte
+/// limit, so arbitrarily large untrusted input causes unbounded work inside this call. Callers
+/// (the pool) must reject oversized shares before invoking this function. Suggested cap: ~8 MiB.
 #[no_mangle]
 pub unsafe extern "C" fn verify_plain_proof_ffi(
     block_header: *const IncompleteBlockHeader,
@@ -61,6 +66,11 @@ pub unsafe extern "C" fn verify_plain_proof_ffi(
 /// (variable-length; the caller copies `public_data[..public_data_len]` into the block certificate),
 /// and `proof_blob`/`proof_blob_len` (the caller-allocated blob must hold `MAX_ZK_PROOF_SIZE` bytes).
 /// Returns 0 = success, 2 = bad input / prove failure / panic.
+///
+/// # Warning
+/// This function does not bound `pp_len`. `PlainProof::deserialize_compat` has no internal byte
+/// limit, so arbitrarily large untrusted input causes unbounded work inside this call. Callers
+/// (the pool) must reject oversized shares before invoking this function. Suggested cap: ~8 MiB.
 #[no_mangle]
 pub unsafe extern "C" fn prove_plain_proof_ffi(
     block_header: *const IncompleteBlockHeader,
@@ -146,11 +156,14 @@ mod tests {
     fn mine_plain_proof_bytes() -> (IncompleteBlockHeader, Vec<u8>) {
         let (header, config, m, n, k) = test_params();
         let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(0xC0FFEE);
-        let pp = loop {
-            if let Some(pp) = try_mine_one_moe(&mut rng, m, n, k, header, config, None, false).unwrap() {
-                break pp;
+        let mut pp = None;
+        for _ in 0..1000 {
+            if let Some(found) = try_mine_one_moe(&mut rng, m, n, k, header, config, None, false).unwrap() {
+                pp = Some(found);
+                break;
             }
-        };
+        }
+        let pp = pp.unwrap_or_else(|| panic!("no MoE proof found in 1000 attempts — check test difficulty params"));
         let bytes = bincode::options().with_fixint_encoding().serialize(&pp).unwrap();
         (header, bytes)
     }
@@ -176,15 +189,13 @@ mod tests {
         let mut err = [0 as c_char; ERROR_MSG_MAX_SIZE];
 
         // 1. cheap blake3 share verify
-        let code =
-            unsafe { verify_plain_proof_ffi(&header, pp_bytes.as_ptr(), pp_bytes.len(), 0, err.as_mut_ptr()) };
+        let code = unsafe { verify_plain_proof_ffi(&header, pp_bytes.as_ptr(), pp_bytes.len(), 0, err.as_mut_ptr()) };
         assert_eq!(code, 0, "verify_plain_proof_ffi rejected a valid proof: {}", err_str(&err));
 
         // 2. plonky2 prove into a caller-allocated CZKProof
         let mut blob = vec![0u8; MAX_ZK_PROOF_SIZE];
         let mut zk = new_czkproof(&mut blob);
-        let code =
-            unsafe { prove_plain_proof_ffi(&header, pp_bytes.as_ptr(), pp_bytes.len(), &mut zk, err.as_mut_ptr()) };
+        let code = unsafe { prove_plain_proof_ffi(&header, pp_bytes.as_ptr(), pp_bytes.len(), &mut zk, err.as_mut_ptr()) };
         assert_eq!(code, 0, "prove_plain_proof_ffi failed: {}", err_str(&err));
         assert!(zk.proof_blob_len > 0, "empty proof blob");
         assert!(zk.public_data_len >= 24, "V2 public_data too short: {}", zk.public_data_len);
@@ -194,18 +205,26 @@ mod tests {
         assert_eq!(code, 0, "verify_zk_proof_v2 rejected the produced cert: {}", err_str(&err));
     }
 
-    /// Regression for the panic-guard: malformed input must not unwind across the FFI boundary
-    /// (deserialization runs inside catch_panic) — it returns the bad-input code 2.
+    /// Malformed input must be rejected with the bad-input code 2 and a deserialize error message.
+    /// Note: this only exercises the `Err` path of `PlainProof::deserialize_compat` — bincode is
+    /// panic-free on malformed input, so a genuine unwind cannot be triggered here to regression-test
+    /// the `catch_panic` wrapping of deserialization (the actual UB guard) directly. That guard is
+    /// verified by code review (deserialization happens inside `catch_panic` in `plain.rs`), not by
+    /// this test.
     #[test]
-    fn prove_plain_proof_ffi_rejects_malformed_without_panic() {
+    fn prove_plain_proof_ffi_rejects_malformed_input() {
         let header = test_params().0;
         let garbage = [0xFFu8; 64];
         let mut blob = vec![0u8; MAX_ZK_PROOF_SIZE];
         let mut zk = new_czkproof(&mut blob);
         let mut err = [0 as c_char; ERROR_MSG_MAX_SIZE];
 
-        let code =
-            unsafe { prove_plain_proof_ffi(&header, garbage.as_ptr(), garbage.len(), &mut zk, err.as_mut_ptr()) };
+        let code = unsafe { prove_plain_proof_ffi(&header, garbage.as_ptr(), garbage.len(), &mut zk, err.as_mut_ptr()) };
         assert_eq!(code, 2, "expected bad-input code 2, got {}: {}", code, err_str(&err));
+        assert!(
+            err_str(&err).contains("deserialize"),
+            "expected a deserialize-stage error message, got: {}",
+            err_str(&err)
+        );
     }
 }

@@ -140,11 +140,7 @@ pub(crate) unsafe fn zk_prove(
 /// `error_msg_out` and `false` is returned.
 /// # Safety
 /// `out.proof_blob` must be non-null and point to a buffer of at least `MAX_ZK_PROOF_SIZE` bytes.
-pub(crate) unsafe fn copy_prove_result(
-    error_msg_out: *mut c_char,
-    out: &mut CZKProof,
-    result: &prove::ProveResult,
-) -> bool {
+pub(crate) unsafe fn copy_prove_result(error_msg_out: *mut c_char, out: &mut CZKProof, result: &prove::ProveResult) -> bool {
     if result.proof_data.len() > MAX_ZK_PROOF_SIZE {
         set_error_msg(error_msg_out, "proof exceeds MAX_ZK_PROOF_SIZE");
         return false;
