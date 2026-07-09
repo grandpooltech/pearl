@@ -136,6 +136,11 @@ jobs:
           cd bindings/go
           cargo build --release
 
+      - name: Test zk_pow_ffi library for Go FFI
+        run: |
+          cd bindings/go
+          cargo test --release
+
   py-pearl-mining-tests:
     name: py-pearl-mining Tests
     runs-on: ubuntu-latest
