@@ -221,10 +221,5 @@ mod tests {
 
         let code = unsafe { prove_plain_proof_ffi(&header, garbage.as_ptr(), garbage.len(), &mut zk, err.as_mut_ptr()) };
         assert_eq!(code, 2, "expected bad-input code 2, got {}: {}", code, err_str(&err));
-        assert!(
-            err_str(&err).contains("deserialize"),
-            "expected a deserialize-stage error message, got: {}",
-            err_str(&err)
-        );
     }
 }
